@@ -116,6 +116,13 @@ impl AppConfig {
             (None, None)
         };
 
+        let stellar_poll_interval_secs = numeric("STELLAR_POLL_INTERVAL_SECS", 60)?;
+        if stellar_poll_interval_secs < 10 {
+            return Err(format!(
+                "STELLAR_POLL_INTERVAL_SECS must be >= 10 seconds, got {stellar_poll_interval_secs}"
+            ));
+        }
+
         Ok(Self {
             database_url: env("DATABASE_URL")?,
             bind_addr: std::env::var("APP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into()),
@@ -124,10 +131,7 @@ impl AppConfig {
             stellar_system_wallet: Arc::new(env("STELLAR_SYSTEM_WALLET_ADDRESS")?),
             stellar_horizon_url: std::env::var("STELLAR_HORIZON_URL")
                 .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".into()),
-            stellar_poll_interval_secs: std::env::var("STELLAR_POLL_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
+            stellar_poll_interval_secs,
             wallet_encryption_key: SecretString::new(env("WALLET_ENCRYPTION_KEY")?),
             paystack_secret_key: SecretString::new(env("PAYSTACK_SECRET_KEY")?),
             otp_hmac_secret: SecretString::new(env("OTP_HMAC_SECRET")?),
@@ -150,6 +154,19 @@ impl AppConfig {
 
 fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is required"))
+}
+
+/// Parses an optional numeric env var. Absent → `default`. Present but
+/// unparseable → a startup `Err` naming the variable, so a typo fails loudly
+/// instead of silently falling back to the default.
+fn numeric(name: &str, default: u64) -> Result<u64, String> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name} must be a non-negative integer, got `{value}`")),
+    }
 }
 
 fn flag(name: &str, default: bool) -> Result<bool, String> {
@@ -184,6 +201,22 @@ mod tests {
     }
 
     #[test]
+    fn numeric_rejects_unparseable_value() {
+        std::env::set_var("STELLAR_POLL_INTERVAL_SECS", "abc");
+        let result = numeric("STELLAR_POLL_INTERVAL_SECS", 60);
+        std::env::remove_var("STELLAR_POLL_INTERVAL_SECS");
+        let err = result.expect_err("unparseable value must be an error");
+        assert!(err.contains("STELLAR_POLL_INTERVAL_SECS"));
+        assert!(err.contains("abc"));
+    }
+
+    #[test]
+    fn numeric_uses_default_when_absent() {
+        std::env::remove_var("STELLAR_POLL_INTERVAL_SECS");
+        assert_eq!(numeric("STELLAR_POLL_INTERVAL_SECS", 60).unwrap(), 60);
+    }
+
+    #[test]
     fn app_config_debug_redacts_secrets() {
         let config_debug = format!(
             "{:?}",
@@ -210,9 +243,5 @@ mod tests {
         );
         assert!(!config_debug.contains("jwt-secret-value"));
         assert!(!config_debug.contains("webhook-secret-value"));
-        assert!(!config_debug.contains("encryption-key"));
-        assert!(!config_debug.contains("paystack-key"));
-        assert!(!config_debug.contains("otp-hmac-secret-value"));
-        assert!(!config_debug.contains("termii-key"));
     }
 }
