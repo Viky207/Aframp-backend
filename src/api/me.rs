@@ -24,22 +24,18 @@ pub struct MeView {
 }
 
 pub async fn get(State(state): State<AppState>, auth: AuthUser) -> ApiResult<Json<MeView>> {
-    let user = users::user_by_id(&state.db, auth.user_id)
+    let row = users::user_with_merchant_by_id(&state.db, auth.user_id)
         .await
         .map_err(internal)?
         .ok_or_else(|| not_found(ErrorCode::UserNotFound, "user not found"))?;
 
-    let merchant = users::merchant_by_user(&state.db, auth.user_id)
-        .await
-        .map_err(internal)?;
-
     Ok(Json(MeView {
-        user_id: user.id,
-        email: user.email,
-        name: user.name,
-        is_admin: user.is_admin,
-        created_at: user.created_at,
-        merchant_id: merchant.as_ref().map(|m| m.id),
-        merchant_name: merchant.map(|m| m.name),
+        user_id: row.user_id,
+        email: row.email,
+        name: row.name,
+        is_admin: row.is_admin,
+        created_at: row.created_at,
+        merchant_id: row.merchant_id,
+        merchant_name: row.merchant_name,
     }))
 }
