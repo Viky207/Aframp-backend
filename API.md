@@ -49,6 +49,75 @@ The supported deployment is **same-origin**: serve the frontend and this API beh
 
 ---
 
+## Authentication Flows
+
+Authentication is a **two-step OTP flow**. Neither `/signup` nor `/login` returns a session directly — both return an OTP challenge, and the session is only issued once the code is verified via `POST /verify-otp`. The two flows have the same shape; they differ only in what the first step validates (new credentials vs. an existing password).
+
+### Signup flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as Aframp API
+    participant SMS as SMS Gateway
+
+    C->>API: POST /signup {email, password, name, phone_number}
+    Note over API: Validate fields, normalize phone to E.164.<br/>Account is NOT created yet.
+    API->>SMS: Send OTP to phone_number
+    SMS-->>C: OTP SMS (6-digit code)
+    API-->>C: 200 {challenge_id, expires_in_secs: 600}
+
+    C->>API: POST /verify-otp {challenge_id, code}
+    Note over API: Check code, expiry (10 min), attempt limit.
+    API-->>C: 200 {token, user_id, merchant_id} + Set-Cookie aframp_session
+    Note over C: User + merchant are inserted here,<br/>on first successful verification.
+```
+
+### Login flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as Aframp API
+    participant SMS as SMS Gateway
+
+    C->>API: POST /login {email, password}
+    Note over API: Verify password. Account must have a phone on file.
+    API->>SMS: Send OTP to the account's phone_number
+    SMS-->>C: OTP SMS (6-digit code)
+    API-->>C: 200 {challenge_id, expires_in_secs: 600}
+
+    C->>API: POST /verify-otp {challenge_id, code}
+    Note over API: Check code, expiry (10 min), attempt limit.
+    API-->>C: 200 {token, user_id, merchant_id} + Set-Cookie aframp_session
+```
+
+### Resending a code
+
+There is no dedicated resend endpoint. **Re-POST the same `/signup` or `/login` request** to get a fresh challenge and a new SMS:
+
+- **Signup:** re-POST `/signup` with the same body. Because the account isn't created until verification, the same email can be re-submitted freely as long as no prior attempt for it was ever verified. The previous `challenge_id` is superseded — use the new one.
+- **Login:** re-POST `/login` with the same credentials. A new challenge is issued and the previous one is superseded.
+
+### Cooldown and hourly limit
+
+Resends are rate-limited per phone number:
+
+- **60-second cooldown** between sends. A resend inside the cooldown returns `429` with code `TOO_MANY_REQUESTS`.
+- **5 sends per hour.** The 5th+ send inside the hour returns `429` with code `TOO_MANY_REQUESTS`.
+
+On `429`, show the user the wait and **do not auto-retry** — retrying immediately just burns the limit.
+
+### Code expiry and attempts
+
+- **Codes expire 10 minutes after they're sent** (`expires_in_secs: 600`). Submitting after that returns `400` with code `OTP_EXPIRED` — request a new challenge via the resend path above.
+- **5 wrong attempts** on a challenge locks it: `400` with code `OTP_LOCKED`. Request a new challenge.
+- A wrong code returns `400` with code `OTP_INVALID`; an unknown or already-consumed `challenge_id` returns `404` with code `OTP_CHALLENGE_NOT_FOUND`.
+
+---
+
 ## Errors
 
 Every error returns the same shape — a human-readable `error` string plus a stable, machine-readable `code` you can branch on:
@@ -141,280 +210,6 @@ No auth. **Does not create the account.** Validates the credentials, sends an OT
 Errors: `400` if email is empty, password is under 8 characters, name is empty, or the phone doesn't parse. `409` (`EMAIL_TAKEN`/`PHONE_TAKEN`) if either is already registered to a *verified* account. `429` (`TOO_MANY_REQUESTS`) if resent within 60s of the last send, or 5 times inside an hour.
 
 ### `POST /login`
-No auth. Verifies the password. If the account has a verified phone number, this returns a **fresh OTP challenge** (identical shape to `/signup`'s) instead of a session — full two-factor, every login, no exception for a returning session. Only an account with no phone on file (impossible to create anymore; a relic of accounts made before this existed) logs in synchronously with the old one-step response.
+No auth. Verifies the password. If the account has a verified phone number, this returns a **fresh OTP challenge** (identical shape to `/signup`'s) instead of a session — full two-factor, every login, no exception for a returning session. Only an account with no phone on file (impossible to create anymore; a relic of accounts made before this existed) logs in synchronously with the old one-step respon
 
-```json
-{ "email": "merchant@example.com", "password": "at-least-8-chars" }
-```
-
-`200` → either `{ "challenge_id": "...", "expires_in_secs": 600 }` (the normal case) or the full session response described under `/verify-otp` below (legacy accounts only).
-
-Errors: `401` for both a wrong password and an unknown email — deliberately indistinguishable, so don't build a "no such account" message from it. `429` on the same resend rules as signup.
-
-### `POST /verify-otp`
-No auth. The **only** endpoint that ever issues a session, reached from either a signup or a login challenge.
-
-```json
-{ "challenge_id": "b6b54b1e-...", "code": "482913" }
-```
-
-`200` →
-```json
-{
-  "token": "eyJ0eXAiOiJKV1Qi...",
-  "user_id": "2c5e0ee2-7f87-4efb-b1c9-d7e1b3ee0eeb",
-  "merchant_id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a"
-}
-```
-…with the same `Set-Cookie: aframp_session=...` as before. For a signup challenge, the user and merchant are created transactionally at this exact moment, not before.
-
-Errors: `400` `OTP_INVALID` (wrong code — 5 wrong guesses and the challenge is dead, not just that attempt), `OTP_EXPIRED` (codes last 10 minutes), `OTP_LOCKED` (attempts exhausted — restart via `/signup` or `/login` for a new one). `404` `OTP_CHALLENGE_NOT_FOUND` for an unknown or already-consumed `challenge_id`.
-
-### `POST /logout`
-No auth — a browser holding an expired or malformed session still needs to clear it. Returns `204` and a `Set-Cookie` that expires `aframp_session` immediately.
-
-Note this clears the browser's session, it does not revoke the JWT: a token already copied elsewhere stays valid until it expires. There's no server-side revocation list yet.
-
-### `GET /me`
-Auth required. The signed-in user's profile. The JWT carries only ids, so call this after a reload to render anything human-readable without forcing a re-login.
-
-`200` →
-```json
-{
-  "user_id": "2c5e0ee2-7f87-4efb-b1c9-d7e1b3ee0eeb",
-  "email": "merchant@example.com",
-  "name": "Shop Name",
-  "created_at": "2026-08-13T14:15:34.232320Z",
-  "merchant_id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
-  "merchant_name": "Shop Name"
-}
-```
-
-`merchant_id` and `merchant_name` are `null` for an account with no merchant. The password hash is never serialized.
-
----
-
-### `POST /wallet/create`
-Auth required. Generates a **real Stellar ed25519 keypair** for the merchant. The private key is AES-256-GCM encrypted server-side and never leaves it.
-
-```json
-{ "network": "stellar" }
-```
-`network` is optional and defaults to `"stellar"`.
-
-`200` →
-```json
-{
-  "id": "18f4244e-8460-4af9-b268-28bc4b23b9ea",
-  "merchant_id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
-  "address": "GDDTPSD7BWERBIKVYXJY4KMBVFCUKNGJB2CS3DWBUUO3IB2CV7BZ5WSR",
-  "network": "stellar",
-  "created_at": "2026-08-13T14:15:34.518727Z"
-}
-```
-
-> **Calling this repeatedly creates a new wallet each time.** There's no idempotency guard. `GET /wallet` returns the most recently created one, so a duplicate call silently changes where new payment requests point. Create a wallet once during onboarding and check `GET /wallet` first.
-
-### `GET /wallet`
-Auth required. The merchant's most recent wallet. Same shape as above.
-
-Errors: `400 "no wallet created yet"` if none exists — that's the signal to run onboarding, not an error to surface raw.
-
----
-
-### `POST /payment-requests`
-Auth required. **The core POS action.** Creates a request for a specific amount and returns a scannable payload.
-
-```json
-{ "amount_stroops": 25000000, "asset": "XLM", "expires_in_secs": 900 }
-```
-
-| Field | Required | Default | Notes |
-|---|---|---|---|
-| `amount_stroops` | yes | — | Must be > 0 |
-| `asset` | no | `"XLM"` | See the cNGN caveat below |
-| `expires_in_secs` | no | `900` (15 min) | Clamped to 60–86400 |
-
-`200` →
-```json
-{
-  "id": "26b6e670-a8b1-471d-ab0f-773a9a318a6a",
-  "merchant_id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
-  "address": "GDDTPSD7BWERBIKVYXJY4KMBVFCUKNGJB2CS3DWBUUO3IB2CV7BZ5WSR",
-  "network": "stellar",
-  "amount_stroops": 25000000,
-  "asset": "XLM",
-  "memo": "1f97c93409172a7d",
-  "status": "pending",
-  "expires_at": "2026-08-13T14:30:34.518727Z",
-  "created_at": "2026-08-13T14:15:34.520195Z",
-  "sep7_uri": "web+stellar:pay?destination=GDDT...&amount=2.5000000&memo=1f97c93409172a7d&memo_type=MEMO_TEXT"
-}
-```
-
-**Render `sep7_uri` as the QR code.** It's a [SEP-0007](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0007.md) payment URI that Stellar wallets open natively. Generate the QR client-side (`qrcode`, `react-qr-code`) — the backend returns the string, not an image.
-
-> **`sep7_uri` is `null` for cNGN.** There's no real cNGN issuer address configured yet, and a guessed issuer would silently misdirect a customer's money. Handle the null case — don't render a broken QR. XLM works today.
-
-**The `memo` is what links a payment to this request.** A customer paying without it still credits the merchant's balance, but the request stays `pending` forever. The SEP-7 URI includes it automatically; if you ever show manual payment instructions, the memo is mandatory.
-
-Errors: `400 "create a wallet before generating payment requests"` if the merchant has no wallet.
-
-### `GET /payment-requests`
-Auth required. The merchant's own requests, **newest first**. Scoped to the authenticated merchant — you cannot see another merchant's requests.
-
-Query: `?limit=` (default 50, clamped 1–200).
-
-`200` → array of the object above.
-
-> Pagination is limit-only — there's no cursor or offset, so you can't page beyond the most recent 200.
-
-### `GET /payment-requests/{id}`
-**No auth** — deliberately public, so a customer's device can read a request before paying.
-
-`200` → same object. `404` if the id doesn't exist.
-
-**Poll this to detect payment.** Deposit detection runs on a timer (`STELLAR_POLL_INTERVAL_SECS`, default 60s), so a payment typically shows up within ~60s of confirming on-chain, not instantly. Poll every 3–5s and show a "waiting for payment" state; don't expect a sub-second flip.
-
-| `status` | Meaning |
-|---|---|
-| `pending` | Not yet paid, not yet expired |
-| `paid` | A memo-matched payment was detected and confirmed |
-| `expired` | `expires_at` passed while still pending |
-
-`expired` is computed at read time, so it's accurate the moment you fetch it. A request that expires and is *then* paid still flips to `paid` — expiry doesn't block correlation.
-
----
-
-### `GET /balance`
-Auth required. One row per asset the merchant has ever held. Returns `[]` for a new merchant — not an error.
-
-`200` →
-```json
-[
-  {
-    "merchant_id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
-    "asset": "XLM",
-    "available": 100000000000,
-    "pending": 0,
-    "updated_at": "2026-08-13T14:15:34.520195Z"
-  }
-]
-```
-
-`available` is withdrawable; `pending` is detected but not yet confirmed. In practice `pending` is almost always `0` — deposits currently move to confirmed immediately (no confirmation-depth threshold yet).
-
-### `GET /transactions`
-Auth required. Detected incoming payments, newest first. Query: `?limit=` (default 50, clamped 1–200).
-
-`200` →
-```json
-[
-  {
-    "id": "f03857f3-b9e3-4bb4-99df-fdab11e69143",
-    "merchant_id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
-    "wallet_id": "3087fc49-6b88-4778-b22d-410fef5e9915",
-    "wallet_address": "GDDTPSD7BWERBIKVYXJY4KMBVFCUKNGJB2CS3DWBUUO3IB2CV7BZ5WSR",
-    "tx_hash": "4b3dc2ebaa551509e55c00240222dff650e0013236471e170512ca992e2304dc",
-    "amount_stroops": 25000000,
-    "asset": "XLM",
-    "network": "stellar",
-    "status": "confirmed",
-    "confirmations": 0,
-    "created_at": "2026-08-13T13:54:20.123456Z",
-    "updated_at": "2026-08-13T13:54:20.987654Z"
-  }
-]
-```
-
-`status` is one of `detected` → `verified` → `confirmed`, or `failed`. `tx_hash` is a real Stellar hash — link it to an explorer (`https://stellar.expert/explorer/testnet/tx/{tx_hash}`).
-
-> `confirmations` is currently always `0` — the confirmation-depth threshold isn't implemented. Don't display it as meaningful.
-
----
-
-### `POST /withdraw`
-Auth required. Debits the merchant's balance and initiates a Nigerian bank payout via Paystack.
-
-```json
-{ "amount_stroops": 500000000, "asset": "cNGN", "bank_code": "058", "account_number": "0123456789" }
-```
-
-| Field | Required | Notes |
-|---|---|---|
-| `amount_stroops` | yes | Must be a whole multiple of `100000` (1 kobo) |
-| `asset` | no | Defaults to `cNGN`; **only cNGN is accepted** |
-| `bank_code` | yes | Paystack bank code, e.g. `058` GTBank, `999992` OPay |
-| `account_number` | yes | Exactly 10 digits (NUBAN) |
-
-`200` → a withdrawal object with `status`, `provider`, `provider_reference`.
-
-Validation errors (`400`): `"insufficient available balance"`, `"withdrawals are only supported for the cNGN asset"`, `"amount_stroops must be a whole number of kobo"`, `"positive amount_stroops, bank_code, and a 10-digit account_number are required"`.
-
-> **Payouts do not currently complete.** The Paystack integration is real and correct, but Aframp's Paystack balance is unfunded, so live calls return `502` with *"Your balance is not enough to fulfil this request."* On failure the balance is **automatically refunded** and the withdrawal is recorded with `status: "failed"` and a `failure_reason` — no money or ledger record is lost. Treat `502` as "try later," not as data loss. Paystack's own minimum transfer is ₦50 = `500000000` stroops.
-
-### `GET /withdrawals`
-Auth required. Newest first. Query: `?limit=` (default 50, clamped 1–200).
-
-`200` →
-```json
-[
-  {
-    "id": "4d8513ce-1ba4-47d8-be93-f079f18a1c71",
-    "merchant_id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
-    "amount_stroops": 500000000,
-    "asset": "cNGN",
-    "status": "failed",
-    "provider": null,
-    "provider_reference": null,
-    "bank_code": "999992",
-    "account_number": "8038714250",
-    "failure_reason": "Paystack error (HTTP 400 Bad Request): Your balance is not enough to fulfil this request",
-    "created_at": "2026-08-13T17:10:50.729251Z",
-    "updated_at": "2026-08-13T17:10:52.853489Z"
-  }
-]
-```
-
-`status` is `pending`, `processing`, `completed`, or `failed`. Show `failure_reason` on failed rows — it carries the provider's own wording.
-
----
-
-## Building the POS flow
-
-The core merchant loop:
-
-1. `POST /payment-requests` with the amount → get `id` and `sep7_uri`
-2. Render `sep7_uri` as a QR code; show the amount and a countdown to `expires_at`
-3. Poll `GET /payment-requests/{id}` every 3–5s
-4. On `status: "paid"` → show "Payment received"; on `"expired"` → offer to regenerate
-
-```js
-async function waitForPayment(id, { signal } = {}) {
-  while (!signal?.aborted) {
-    const res = await fetch(`${API}/payment-requests/${id}`, { signal });
-    if (!res.ok) throw new Error(`lookup failed: ${res.status}`);
-    const pr = await res.json();
-    if (pr.status !== 'pending') return pr;      // 'paid' or 'expired'
-    await new Promise((r) => setTimeout(r, 4000));
-  }
-}
-```
-
-Note step 3 needs no auth token, so a customer-facing payment page can use it directly.
-
----
-
-## Not available yet
-
-Worth knowing before you design around them:
-
-- **No websockets / SSE.** Payment status is poll-only.
-- **No refresh tokens.** A 24h expiry means a re-login, not a silent refresh.
-- **No token revocation.** `POST /logout` clears the browser's cookie; it cannot invalidate a JWT that has already been copied somewhere else.
-- **No rate limiting on the password check itself.** OTP sends are throttled (60s cooldown, 5/hour per phone), but nothing yet stops repeated wrong-password guesses against `/login` before it ever gets to that step.
-- **No cursor pagination.** `limit` only, capped at 200.
-- **No cancel/delete on payment requests.** They can only expire naturally.
-- **No `PATCH`/`DELETE` anywhere** — and CORS only allows `GET`/`POST`, so adding one needs a server change too.
-- **cNGN QR codes**, pending a real issuer address.
-- **Completed payouts**, pending funding (see `PRD.md` §9.1).
+/* … truncated 11855 chars — edit only what you need near the top … */
