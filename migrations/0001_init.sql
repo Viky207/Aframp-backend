@@ -72,10 +72,15 @@ CREATE TABLE api_keys (
   revoked_at TIMESTAMPTZ
 );
 
+-- Audit trail for inbound provider webhooks (Termii, Paystack, ...).
+-- merchant_id is nullable because some providers (e.g. Termii SMS delivery
+-- receipts) are not merchant-specific; such events are still recorded so the
+-- table reflects a real audit trail rather than an always-empty placeholder.
 CREATE TABLE webhook_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  merchant_id UUID NOT NULL REFERENCES merchants(id),
+  merchant_id UUID REFERENCES merchants(id),
   provider TEXT NOT NULL,
+  event_type TEXT,
   external_id TEXT NOT NULL,
   payload JSONB NOT NULL,
   received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
