@@ -1,4 +1,6 @@
 use axum::extract::{Path, Query, State};
+use axum::http::header;
+use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -76,6 +78,48 @@ pub async fn get(
         .ok_or_else(|| internal("payment request references a missing wallet"))?;
 
     Ok(Json(to_view(&pr, &wallet.address, &wallet.network)))
+}
+
+#[derive(serde::Deserialize)]
+pub struct QrParams {
+    pub size: Option<u32>,
+}
+
+/// Renders the request's SEP-7 URI as a PNG QR code so merchant POS terminals
+/// can display it without a client-side QR library. Public, like `get`.
+pub async fn qr(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<QrParams>,
+) -> ApiResult<impl IntoResponse> {
+    let pr = payment_requests::payment_request_by_id(&state.db, id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| not_found(ErrorCode::PaymentRequestNotFound, "payment request not found"))?;
+
+    let wallet = wallets::wallet_by_id(&state.db, pr.wallet_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| internal("payment request references a missing wallet"))?;
+
+    let uri = build_sep7_uri(&wallet.address, pr.amount_stroops, &pr.asset, &pr.memo)
+        .ok_or_else(|| not_found(ErrorCode::PaymentRequestNotFound, "payment request has no SEP-7 URI"))?;
+
+    let size = params.size.unwrap_or(256).clamp(64, 1024);
+
+    let code = qrcode::QrCode::new(uri.as_bytes())
+        .map_err(|e| internal(format!("failed to encode QR code: {e}")))?;
+    let image = code
+        .render::<image::Luma<u8>>()
+        .min_dimensions(size, size)
+        .build();
+
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| internal(format!("failed to encode PNG: {e}")))?;
+
+    Ok(([(header::CONTENT_TYPE, "image/png")], png))
 }
 
 pub async fn list(
