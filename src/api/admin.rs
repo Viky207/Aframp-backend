@@ -27,6 +27,7 @@ use crate::models::{
 };
 use crate::pagination::{Cursor, Page};
 use crate::services::admin;
+use crate::services::merchant;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -254,6 +255,88 @@ pub async fn unlock_user(
     } else {
         Err(not_found(ErrorCode::UserNotFound, "user not found"))
     }
+}
+
+#[derive(Deserialize)]
+pub struct KycSubmission {
+    pub bvn: Option<String>,
+    pub cac_number: Option<String>,
+}
+
+/// `PUT /merchants/kyc` — a merchant submits basic KYC info. On success the
+/// merchant's `kyc_status` moves to `pending` and the updated record is
+/// returned.
+pub async fn submit_kyc(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(payload): Json<KycSubmission>,
+) -> ApiResult<Json<Merchant>> {
+    let merchant_id = auth
+        .merchant_id
+        .ok_or_else(|| forbidden("only merchants can submit KYC"))?;
+
+    let bvn = payload
+        .bvn
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let cac_number = payload
+        .cac_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if bvn.is_none() && cac_number.is_none() {
+        return Err(bad_request("provide at least a BVN or CAC number"));
+    }
+
+    if let Some(bvn) = bvn {
+        if bvn.len() != 11 || !bvn.chars().all(|c| c.is_ascii_digit()) {
+            return Err(bad_request("BVN must be exactly 11 digits"));
+        }
+    }
+
+    if let Some(cac_number) = cac_number {
+        if cac_number.len() < 2 || cac_number.len() > 32 {
+            return Err(bad_request("CAC number must be between 2 and 32 characters"));
+        }
+        if !cac_number
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '/')
+        {
+            return Err(bad_request("CAC number contains invalid characters"));
+        }
+    }
+
+    let merchant = merchant::submit_kyc(&state.db, merchant_id, bvn, cac_number)
+        .await
+        .map_err(internal)?;
+    Ok(Json(merchant))
+}
+
+#[derive(Deserialize)]
+pub struct KycDecision {
+    pub status: String,
+}
+
+/// `PATCH /admin/merchants/{id}/kyc` — an admin approves or rejects a
+/// merchant's KYC submission.
+pub async fn update_merchant_kyc(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<i64>,
+    Json(payload): Json<KycDecision>,
+) -> ApiResult<Json<Merchant>> {
+    let status = payload.status.trim().to_ascii_lowercase();
+    if status != "verified" && status != "rejected" {
+        return Err(bad_request("status must be 'verified' or 'rejected'"));
+    }
+
+    let merchant = merchant::set_kyc_status(&state.db, id, &status)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| not_found("merchant not found"))?;
+    Ok(Json(merchant))
 }
 
 /// Static dashboard shell. Unauthenticated by design — it's markup and JS with

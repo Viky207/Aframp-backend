@@ -110,6 +110,7 @@ async fn poll_once(
     }
     let addresses: Vec<String> = wallets_by_address.keys().cloned().collect();
 
+    let addresses: Vec<String> = wallets_by_address.keys().cloned().collect();
     let deposits = listener.fetch_deposits(&addresses).await?;
     for deposit in deposits {
         if let Err(err) = process_deposit(db, &wallets_by_address, deposit).await {

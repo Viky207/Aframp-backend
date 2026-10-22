@@ -251,6 +251,56 @@ pub async fn set_merchant_kyc(
     .await
 }
 
+pub async fn submit_kyc(
+    db: &PgPool,
+    merchant_id: uuid::Uuid,
+    bvn: Option<&str>,
+    cac_number: Option<&str>,
+) -> Result<Merchant, sqlx::Error> {
+    sqlx::query_as::<_, Merchant>(
+        "UPDATE merchants
+         SET bvn = COALESCE($2, bvn),
+             cac_number = COALESCE($3, cac_number),
+             kyc_status = 'pending',
+             updated_at = now()
+         WHERE id = $1
+         RETURNING *",
+    )
+    .bind(merchant_id)
+    .bind(bvn)
+    .bind(cac_number)
+    .fetch_one(db)
+    .await
+}
+
+pub async fn set_kyc_status(
+    db: &PgPool,
+    merchant_id: uuid::Uuid,
+    status: &str,
+) -> Result<Merchant, sqlx::Error> {
+    sqlx::query_as::<_, Merchant>(
+        "UPDATE merchants
+         SET kyc_status = $2,
+             updated_at = now()
+         WHERE id = $1
+         RETURNING *",
+    )
+    .bind(merchant_id)
+    .bind(status)
+    .fetch_one(db)
+    .await
+}
+
+pub async fn merchant_kyc_status(
+    db: &PgPool,
+    merchant_id: uuid::Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT kyc_status FROM merchants WHERE id = $1")
+        .bind(merchant_id)
+        .fetch_optional(db)
+        .await
+}
+
 pub async fn wallets(db: &PgPool, limit: i64) -> Result<Vec<AdminWalletRow>, sqlx::Error> {
     sqlx::query_as::<_, AdminWalletRow>(
         "SELECT w.id, w.merchant_id, m.name AS merchant_name, w.address, w.network, w.created_at

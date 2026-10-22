@@ -28,6 +28,9 @@ CREATE TABLE merchants (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id),
   name TEXT NOT NULL,
+  kyc_status TEXT NOT NULL DEFAULT 'unverified' CHECK (kyc_status IN ('unverified', 'pending', 'verified', 'rejected')),
+  bvn TEXT,
+  cac_number TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
