@@ -219,6 +219,13 @@ impl AppConfig {
         let otp_hmac_secret = env("OTP_HMAC_SECRET")?;
         require_min_len("OTP_HMAC_SECRET", &otp_hmac_secret, MIN_SECRET_LEN)?;
 
+        let stellar_poll_interval_secs = numeric("STELLAR_POLL_INTERVAL_SECS", 60)?;
+        if stellar_poll_interval_secs < 10 {
+            return Err(format!(
+                "STELLAR_POLL_INTERVAL_SECS must be >= 10 seconds, got {stellar_poll_interval_secs}"
+            ));
+        }
+
         Ok(Self {
             database_url: env("DATABASE_URL")?,
             db_max_connections: std::env::var("DB_MAX_CONNECTIONS")
@@ -243,6 +250,7 @@ impl AppConfig {
             stellar_system_wallet: Arc::new(env("STELLAR_SYSTEM_WALLET_ADDRESS")?),
             stellar_horizon_url: std::env::var("STELLAR_HORIZON_URL")
                 .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".into()),
+            stellar_poll_interval_secs,
             stellar_poll_interval_secs: std::env::var("STELLAR_POLL_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -290,6 +298,17 @@ fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is required"))
 }
 
+/// Parses an optional numeric env var. Absent → `default`. Present but
+/// unparseable → a startup `Err` naming the variable, so a typo fails loudly
+/// instead of silently falling back to the default.
+fn numeric(name: &str, default: u64) -> Result<u64, String> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name} must be a non-negative integer, got `{value}`")),
+    }
 fn require_min_len(name: &str, value: &str, min: usize) -> Result<(), String> {
     if value.len() < min {
         return Err(format!(
@@ -479,6 +498,22 @@ mod tests {
     fn require_min_len_accepts_valid_secret() {
         let secret = "a".repeat(MIN_SECRET_LEN);
         assert!(require_min_len("JWT_SECRET", &secret, MIN_SECRET_LEN).is_ok());
+    }
+
+    #[test]
+    fn numeric_rejects_unparseable_value() {
+        std::env::set_var("STELLAR_POLL_INTERVAL_SECS", "abc");
+        let result = numeric("STELLAR_POLL_INTERVAL_SECS", 60);
+        std::env::remove_var("STELLAR_POLL_INTERVAL_SECS");
+        let err = result.expect_err("unparseable value must be an error");
+        assert!(err.contains("STELLAR_POLL_INTERVAL_SECS"));
+        assert!(err.contains("abc"));
+    }
+
+    #[test]
+    fn numeric_uses_default_when_absent() {
+        std::env::remove_var("STELLAR_POLL_INTERVAL_SECS");
+        assert_eq!(numeric("STELLAR_POLL_INTERVAL_SECS", 60).unwrap(), 60);
     }
 
     #[test]

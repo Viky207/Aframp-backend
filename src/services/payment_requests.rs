@@ -10,6 +10,9 @@ const DEFAULT_EXPIRY_SECS: i64 = 15 * 60;
 const MIN_EXPIRY_SECS: i64 = 60;
 const MAX_EXPIRY_SECS: i64 = 24 * 60 * 60;
 
+/// Default QR image dimension (in pixels) when no `size` is supplied.
+pub const DEFAULT_QR_SIZE: u32 = 256;
+/// Upper bound on the requested QR dimension to keep generation cheap.
 /// Retention window after which expired+cancelled rows are hard-deleted.
 pub const HARD_DELETE_AFTER_DAYS: i64 = 30;
 /// Default edge length (in pixels) of a rendered payment request QR code.
@@ -56,6 +59,18 @@ pub enum QrError {
     Encode(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum QrError {
+    #[error("payment request has no SEP-7 URI")]
+    NoSep7Uri,
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    Encode(#[from] qrcode::types::QrError),
+    #[error(transparent)]
+    Image(#[from] image::ImageError),
 }
 
 fn generate_memo() -> String {
@@ -349,6 +364,33 @@ pub async fn payment_request_by_id(db: &PgPool, id: Uuid) -> Result<Option<Payme
     .await
 }
 
+/// Renders the SEP-7 URI of a payment request as a PNG QR code.
+///
+/// `size` is clamped to `[1, MAX_QR_SIZE]`; callers should pass
+/// [`DEFAULT_QR_SIZE`] when the client didn't specify one. Returns
+/// [`QrError::NoSep7Uri`] when the request has no SEP-7 URI (e.g. cNGN
+/// without an issuer configured), which the API maps to a 404.
+pub async fn payment_request_qr_png(
+    db: &PgPool,
+    id: Uuid,
+    size: u32,
+) -> Result<Vec<u8>, QrError> {
+    let request = payment_request_by_id(db, id).await?;
+    let sep7_uri = request
+        .and_then(|r| r.sep7_uri)
+        .filter(|uri| !uri.is_empty())
+        .ok_or(QrError::NoSep7Uri)?;
+
+    let size = size.clamp(1, MAX_QR_SIZE);
+    let code = qrcode::QrCode::new(sep7_uri.as_bytes())?;
+    let image = code
+        .render::<image::Luma<u8>>()
+        .min_dimensions(size, size)
+        .build();
+
+    let mut png = Vec::new();
+    image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    Ok(png)
 /// Soft-delete: sets `cancelled_at` for a request owned by `merchant_id`.
 /// Returns the updated row, or `None` if it does not exist / is not owned /
 /// was already cancelled.

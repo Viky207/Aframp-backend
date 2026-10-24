@@ -50,6 +50,9 @@ The supported deployment is **same-origin**: serve the frontend and this API beh
 
 ---
 
+## Authentication Flows
+
+Authentication is a **two-step OTP flow**. Neither `/signup` nor `/login` returns a session directly — both return an OTP challenge, and the session is only issued once the code is verified via `POST /verify-otp`. The two flows have the same shape; they differ only in what the first step validates (new credentials vs. an existing password).
 ## Authentication Flow
 
 Sessions are **always two-step** for any account with a verified phone number. Neither `/signup` nor `/login` issues a session — they only fire an OTP. The session is issued exclusively by `POST /verify-otp`.
@@ -58,6 +61,23 @@ Sessions are **always two-step** for any account with a verified phone number. N
 
 ```mermaid
 sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as Aframp API
+    participant SMS as SMS Gateway
+
+    C->>API: POST /signup {email, password, name, phone_number}
+    Note over API: Validate fields, normalize phone to E.164.<br/>Account is NOT created yet.
+    API->>SMS: Send OTP to phone_number
+    SMS-->>C: OTP SMS (6-digit code)
+    API-->>C: 200 {challenge_id, expires_in_secs: 600}
+
+    C->>API: POST /verify-otp {challenge_id, code}
+    Note over API: Check code, expiry (10 min), attempt limit.
+    API-->>C: 200 {token, user_id, merchant_id} + Set-Cookie aframp_session
+    Note over C: User + merchant are inserted here,<br/>on first successful verification.
+```
+
     participant C as Client
     participant A as Aframp API
     participant T as Termii (SMS)
@@ -93,6 +113,43 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as Aframp API
+    participant SMS as SMS Gateway
+
+    C->>API: POST /login {email, password}
+    Note over API: Verify password. Account must have a phone on file.
+    API->>SMS: Send OTP to the account's phone_number
+    SMS-->>C: OTP SMS (6-digit code)
+    API-->>C: 200 {challenge_id, expires_in_secs: 600}
+
+    C->>API: POST /verify-otp {challenge_id, code}
+    Note over API: Check code, expiry (10 min), attempt limit.
+    API-->>C: 200 {token, user_id, merchant_id} + Set-Cookie aframp_session
+```
+
+### Resending a code
+
+There is no dedicated resend endpoint. **Re-POST the same `/signup` or `/login` request** to get a fresh challenge and a new SMS:
+
+- **Signup:** re-POST `/signup` with the same body. Because the account isn't created until verification, the same email can be re-submitted freely as long as no prior attempt for it was ever verified. The previous `challenge_id` is superseded — use the new one.
+- **Login:** re-POST `/login` with the same credentials. A new challenge is issued and the previous one is superseded.
+
+### Cooldown and hourly limit
+
+Resends are rate-limited per phone number:
+
+- **60-second cooldown** between sends. A resend inside the cooldown returns `429` with code `TOO_MANY_REQUESTS`.
+- **5 sends per hour.** The 5th+ send inside the hour returns `429` with code `TOO_MANY_REQUESTS`.
+
+On `429`, show the user the wait and **do not auto-retry** — retrying immediately just burns the limit.
+
+### Code expiry and attempts
+
+- **Codes expire 10 minutes after they're sent** (`expires_in_secs: 600`). Submitting after that returns `400` with code `OTP_EXPIRED` — request a new challenge via the resend path above.
+- **5 wrong attempts** on a challenge locks it: `400` with code `OTP_LOCKED`. Request a new challenge.
+- A wrong code returns `400` with code `OTP_INVALID`; an unknown or already-consumed `challenge_id` returns `404` with code `OTP_CHALLENGE_NOT_FOUND`.
     participant C as Client
     participant A as Aframp API
     participant T as Termii (SMS)
@@ -356,6 +413,9 @@ No auth. **Does not create the account.** Validates the credentials, sends an OT
 Errors: `400` if email is empty/invalid/oversized, password is under 8 characters, name is empty or longer than 100 characters, or the phone doesn't parse. `409` (`EMAIL_TAKEN`/`PHONE_TAKEN`) if either is already registered to a *verified* account. `429` (`TOO_MANY_REQUESTS`) if resent within 60s of the last send, or 5 times inside an hour.
 
 ### `POST /login`
+No auth. Verifies the password. If the account has a verified phone number, this returns a **fresh OTP challenge** (identical shape to `/signup`'s) instead of a session — full two-factor, every login, no exception for a returning session. Only an account with no phone on file (impossible to create anymore; a relic of accounts made before this existed) logs in synchronously with the old one-step respon
+
+/* … truncated 11855 chars — edit only what you need near the top … */
 #### Error Responses
 - `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "must be a valid email address", "code": "INVALID_PARAMETERS", "field": "email" }` (the `field` may be `email` or `password`)
 - `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid email or password", "code": "INVALID_CREDENTIALS" }`

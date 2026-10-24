@@ -72,9 +72,54 @@ impl AppState {
     }
 }
 
+/// Minimum allowed value for `STELLAR_POLL_INTERVAL_SECS`.
+const MIN_STELLAR_POLL_INTERVAL_SECS: u64 = 10;
+
+/// Parse an optional numeric env var, failing fast on invalid values.
+///
+/// Returns `Ok(None)` when the variable is unset, `Ok(Some(v))` when it parses,
+/// and a descriptive `Err` when it is set but unparseable or below `min`.
+fn parse_numeric_env<T>(name: &str, min: Option<T>) -> Result<Option<T>, String>
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
+{
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value = raw
+                .trim()
+                .parse::<T>()
+                .map_err(|_| format!("invalid value for {name}: {raw:?} is not a valid number"))?;
+            if let Some(min) = min {
+                if value < min {
+                    return Err(format!(
+                        "invalid value for {name}: {value} is below the minimum of {min}"
+                    ));
+                }
+            }
+            Ok(Some(value))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("invalid value for {name}: not valid unicode"))
+        }
+    }
+}
+
+/// Resolve the Stellar poll interval, failing fast on invalid configuration.
+pub fn stellar_poll_interval_secs() -> Result<u64, String> {
+    Ok(parse_numeric_env("STELLAR_POLL_INTERVAL_SECS", Some(MIN_STELLAR_POLL_INTERVAL_SECS))?
+        .unwrap_or(60))
+}
+
+/// Resolve the database max connections, failing fast on invalid configuration.
+pub fn db_max_connections() -> Result<u32, String> {
+    Ok(parse_numeric_env("DB_MAX_CONNECTIONS", Some(1u32))?.unwrap_or(5))
+}
+
 pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::error::Error>> {
+    let max_connections = db_max_connections()?;
     let db = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(max_connections)
         .connect(&config.database_url)
         .await?;
     let wallet_encryption_key = blockchain::wallet_crypto::parse_key(config.wallet_encryption_key.as_str())?;
@@ -356,5 +401,35 @@ mod cors_tests {
             status.is_success(),
             "DELETE preflight should be allowed, got {status}"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_env_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_stellar_poll_interval_returns_err() {
+        std::env::set_var("STELLAR_POLL_INTERVAL_SECS", "abc");
+        let result = stellar_poll_interval_secs();
+        std::env::remove_var("STELLAR_POLL_INTERVAL_SECS");
+        assert!(result.is_err(), "expected Err for unparseable poll interval");
+        assert!(result.unwrap_err().contains("STELLAR_POLL_INTERVAL_SECS"));
+    }
+
+    #[test]
+    fn too_low_stellar_poll_interval_returns_err() {
+        std::env::set_var("STELLAR_POLL_INTERVAL_SECS", "1");
+        let result = stellar_poll_interval_secs();
+        std::env::remove_var("STELLAR_POLL_INTERVAL_SECS");
+        assert!(result.is_err(), "expected Err for poll interval below minimum");
+    }
+
+    #[test]
+    fn invalid_db_max_connections_returns_err() {
+        std::env::set_var("DB_MAX_CONNECTIONS", "not-a-number");
+        let result = db_max_connections();
+        std::env::remove_var("DB_MAX_CONNECTIONS");
+        assert!(result.is_err(), "expected Err for unparseable DB_MAX_CONNECTIONS");
     }
 }
